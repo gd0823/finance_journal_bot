@@ -34,12 +34,19 @@ jobs:
         RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
       run: python main.py
 
-    - name: Commit and Push DB changes
+- name: Commit and Push DB changes
       run: |
         git config --global user.name "GitHub Action Bot"
         git config --global user.email "actions@github.com"
-        # 检查数据库文件是否有变化
+        
+        # 1. 先把本地的新数据库添加进暂存区
         git add finance_journals.db
-        # 如果没有变化（没有新文章），commit会报错，所以加了 || exit 0 忽略错误
+        
+        # 2. 尝试提交（如果没有变化就不提交）
         git commit -m "Update database records [skip ci]" || exit 0
+        
+        # 3. 【关键步骤】拉取云端最新的代码，并把我们的修改“叠加”在上面 (Rebase)
+        git pull --rebase origin main
+        
+        # 4. 最后再推送
         git push
