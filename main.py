@@ -21,7 +21,6 @@ SMTP_SERVER = "smtp.qq.com"
 SMTP_PORT = 465
 
 # 2. 🛡️ 【白名单兜底】中英文关键词 (不区分大小写)
-# 包含这些词的标题，直接强制判定为“感兴趣”，不经过AI
 MUST_HAVE_KEYWORDS = [
     # --- English ---
     "fintech", "financial technology", 
@@ -29,7 +28,7 @@ MUST_HAVE_KEYWORDS = [
     "climate risk", "esg", "textual analysis",
     # --- 中文 ---
     "金融科技", "机器学习", "深度学习", "神经网络", "文本分析",
-    "气候风险", "ESG", "大语言模型", "高频交易", "量化投资"
+     "大语言模型", "高频交易", "量化投资"
 ]
 
 # 3. 🤖 【AI 判别标准】
@@ -46,8 +45,7 @@ USER_INTEREST_DESCRIPTION = """
 - 如果没有摘要，仅根据标题判断。
 """
 
-# 4. 📚 期刊 RSS 列表 (含英文顶刊 + 中文顶刊)
-# 注意：中文期刊使用 RSSHub 生成的知网链接
+# 4. 📚 期刊 RSS 列表
 RSS_FEEDS = {
     # === 英文 Top Journals ===
     "Journal of Finance": "https://onlinelibrary.wiley.com/feed/15406261/most-recent",
@@ -58,17 +56,11 @@ RSS_FEEDS = {
     "Review of Finance": "https://academic.oup.com/rss/site_5409/3133.xml",
     
     # === 中文 Top Journals (via RSSHub) ===
-    # 经济研究 (CNKI Code: JJYJ)
     "经济研究": "https://rsshub.app/cnki/journals/JJYJ",
-    # 管理世界 (CNKI Code: GLSJ)
     "管理世界": "https://rsshub.app/cnki/journals/GLSJ",
-    # 金融研究 (CNKI Code: JRYJ)
     "金融研究": "https://rsshub.app/cnki/journals/JRYJ",
-    # 数量经济技术经济研究 (CNKI Code: SLJY)
     "数量经济技术经济研究": "https://rsshub.app/cnki/journals/SLJY",
-    # 中国工业经济 (CNKI Code: GGYY)
     "中国工业经济": "https://rsshub.app/cnki/journals/GGYY",
-    # 经济学(季刊) (CNKI Code: JJXJ)
     "经济学季刊": "https://rsshub.app/cnki/journals/JJXJ"
 }
 
@@ -106,7 +98,6 @@ def get_ai_judgement(title, abstract):
 
 def clean_html(raw):
     if not raw: return ""
-    # 移除 RSSHub 加入的无关广告词
     text = BeautifulSoup(raw, "html.parser").get_text(separator=' ')
     return ' '.join(text.split())
 
@@ -148,32 +139,35 @@ def run_job():
     interesting_count = 0
     pending_save = []
 
-    # 忽略 SSL 证书验证 (解决 RSSHub 有时证书报错的问题)
+    # 忽略 SSL 证书验证
     if hasattr(ssl, '_create_unverified_context'):
         ssl._create_default_https_context = ssl._create_unverified_context
+
+    # 【新增】伪装成 Chrome 浏览器，防止被拦截 (解决 No entries 问题)
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
 
     for journal, url in RSS_FEEDS.items():
         print(f"Checking {journal}...")
         try:
-            # 增加超时设置，因为 RSSHub 有时较慢
-            feed = feedparser.parse(url) 
+            # 传入 request_headers
+            feed = feedparser.parse(url, request_headers=headers)
             
             if not feed.entries:
-                print(f"  > Warning: No entries for {journal} (Link might be blocked temporarily)")
+                print(f"  > Warning: No entries for {journal}")
                 continue
 
-            # 中文期刊通常一更就是一期(10-20篇)，检查前 20 篇
             for entry in feed.entries[:20]: 
                 title = entry.title
                 link = entry.link
-                # 处理日期格式，如果获取失败默认用今天
                 date = datetime.now().strftime('%Y-%m-%d')
                 if 'published' in entry:
                     try: date = entry.published[:10]
                     except: pass
                 
                 if is_new(link):
-                    # 1. 关键词白名单检查 (支持中文)
+                    # 1. 关键词白名单检查
                     is_match = False
                     for kw in MUST_HAVE_KEYWORDS:
                         if kw.lower() in title.lower():
@@ -187,11 +181,19 @@ def run_job():
                     if not is_match:
                         print(f"  ...asking AI: {title[:30]}...")
                         is_match = get_ai_judgement(title, summary)
-                        time.sleep(0.2)
+                        time.sleep(0.2) # 防止 API 超速
 
                     if journal not in monthly_data: monthly_data[journal] = []
                     
-                    info = {"title": title, "link": link, "date": date, "summary": summary, "is_interesting": is_match}
+                    # 【关键修复】补全 info 字典，加入 journal 字段
+                    info = {
+                        "title": title, 
+                        "link": link, 
+                        "date": date, 
+                        "summary": summary, 
+                        "is_interesting": is_match,
+                        "journal": journal  # 之前报错是因为缺了这个
+                    }
                     
                     if is_match:
                         monthly_data[journal].insert(0, info)
@@ -211,7 +213,7 @@ def run_job():
         html = f"""<html><body style="font-family:Arial;">
         <h2>📅 顶刊文献更新 (中英文混排)</h2>
         <div style="background:#e8f4fd;padding:10px;margin-bottom:20px;border-radius:5px;">
-        <b>筛选策略：</b>包含 FinTech/机器学习/气候风险 等中英文关键词，或经 AI 判定符合兴趣。
+        <b>筛选策略：</b>包含 FinTech/机器学习/计量 等中英文关键词，或经 AI 判定符合兴趣。
         </div><hr>"""
         
         for journal, arts in monthly_data.items():
@@ -230,7 +232,10 @@ def run_job():
         html += "</body></html>"
 
         if send_email(f"{subject_icon}文献更新: {interesting_count}篇精选 ({total_new}篇新增)", html):
-            for art in pending_save: save_article(art['link'], art['title'], art['journal'], art['date'])
+            for art in pending_save: 
+                # 这里现在不会报错了
+                save_article(art['link'], art['title'], art['journal'], art['date'])
+            
             # 自动同步数据库
             os.system('git config --global user.name "Bot" && git config --global user.email "bot@bot.com"')
             os.system('git add finance_journals.db && git commit -m "Update DB" && git pull --rebase origin main && git push')
