@@ -3,6 +3,7 @@ import sqlite3
 import smtplib
 import os
 import time
+import ssl
 from email.mime.text import MIMEText
 from email.header import Header
 from datetime import datetime
@@ -11,225 +12,228 @@ from openai import OpenAI
 
 # ================= 配置区域 =================
 
-# 1. 环境变量 (GitHub Secrets)
+# 1. 环境变量
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL")
 SENDER_PASSWORD = os.environ.get("SENDER_PASSWORD")
 RECEIVER_EMAIL = os.environ.get("RECEIVER_EMAIL")
 LLM_API_KEY = os.environ.get("LLM_API_KEY")
-
 SMTP_SERVER = "smtp.qq.com"
 SMTP_PORT = 465
 
-# 2. 🤖 [核心修改] 用自然语言描述你的研究兴趣
-# 你可以写得很具体，AI 会理解其中的概念、同义词和隐含逻辑。
+# 2. 🛡️ 【白名单兜底】中英文关键词 (不区分大小写)
+# 包含这些词的标题，直接强制判定为“感兴趣”，不经过AI
+MUST_HAVE_KEYWORDS = [
+    # --- English ---
+    "fintech", "financial technology", 
+    "machine learning", "deep learning", "neural network",
+    "climate risk", "esg", "textual analysis",
+    # --- 中文 ---
+    "金融科技", "机器学习", "深度学习", "神经网络", "文本分析",
+    "气候风险", "ESG", "大语言模型", "高频交易", "量化投资"
+]
+
+# 3. 🤖 【AI 判别标准】
 USER_INTEREST_DESCRIPTION = """
-我的主要研究兴趣是金融科技（FinTech）和机器学习在资产定价中的应用。
-具体包括：
-1. 深度学习、神经网络、NLP文本分析在预测股票收益率中的应用。
-2. 市场微观结构中的高频交易策略。
-3. 因果推断和计量方法
+我的研究兴趣非常广泛，请采取【宽容策略】，只要文章符合以下**任意一个**方向，都回答 Yes：
+
+1. **金融科技 (FinTech)**：涉及高频交易、市场微观结构、支付、区块链、数字货币及货币理论的任何话题。
+2. **AI与大数据**：金融中的机器学习、NLP文本分析、情感分析、高维数据预测。
+3. **资产定价**：股票收益预测、因子模型、量化策略。
+4. **计量**：因果推断模型、计量模型。
+
+注意：
+- 对于中文文章，请同样应用上述标准。
+- 如果没有摘要，仅根据标题判断。
 """
 
-# 3. 大模型配置 (这里默认使用 DeepSeek，因为它便宜且强大)
-# 如果你想用 ChatGPT，Base_URL 改为 "https://api.openai.com/v1", Model 改为 "gpt-4o-mini"
-LLM_BASE_URL = "https://api.deepseek.com" 
-LLM_MODEL = "deepseek-chat"
-
-# 4. RSS 列表
+# 4. 📚 期刊 RSS 列表 (含英文顶刊 + 中文顶刊)
+# 注意：中文期刊使用 RSSHub 生成的知网链接
 RSS_FEEDS = {
+    # === 英文 Top Journals ===
     "Journal of Finance": "https://onlinelibrary.wiley.com/feed/15406261/most-recent",
     "JFE": "https://www.sciencedirect.com/science/journal/0304405X/rss", 
     "RFS": "https://academic.oup.com/rss/site_5378/3126.xml",
     "JFQA": "https://www.cambridge.org/core/rss/product/id/1638F6E6C5C0F911299901594F817173",
     "Management Science": "http://pubsonline.informs.org/action/showFeed?type=etoc&feed=rss&jc=mnsc",
-    "Review of Finance": "https://academic.oup.com/rss/site_5409/3133.xml"
+    "Review of Finance": "https://academic.oup.com/rss/site_5409/3133.xml",
+    
+    # === 中文 Top Journals (via RSSHub) ===
+    # 经济研究 (CNKI Code: JJYJ)
+    "经济研究": "https://rsshub.app/cnki/journals/JJYJ",
+    # 管理世界 (CNKI Code: GLSJ)
+    "管理世界": "https://rsshub.app/cnki/journals/GLSJ",
+    # 金融研究 (CNKI Code: JRYJ)
+    "金融研究": "https://rsshub.app/cnki/journals/JRYJ",
+    # 数量经济技术经济研究 (CNKI Code: SLJY)
+    "数量经济技术经济研究": "https://rsshub.app/cnki/journals/SLJY",
+    # 中国工业经济 (CNKI Code: GGYY)
+    "中国工业经济": "https://rsshub.app/cnki/journals/GGYY",
+    # 经济学(季刊) (CNKI Code: JJXJ)
+    "经济学季刊": "https://rsshub.app/cnki/journals/JJXJ"
 }
 
+LLM_BASE_URL = "https://api.deepseek.com" 
+LLM_MODEL = "deepseek-chat"
 DB_FILE = "finance_journals.db"
 
 # ================= 核心代码 =================
 
 def get_ai_judgement(title, abstract):
-    """调用 LLM 判断文章是否符合兴趣"""
-    if not LLM_API_KEY:
-        print("Error: No API Key found.")
-        return False
-
+    if not LLM_API_KEY: return False
     client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
     
-    # 构造 Prompt
     prompt = f"""
-    你是一个专业的金融学术助手。请根据以下用户的研究兴趣描述，判断给定的一篇论文是否值得推荐给用户。
+    判断这篇金融论文是否符合用户兴趣。
     
-    【用户研究兴趣】：
-    {USER_INTEREST_DESCRIPTION}
+    【用户兴趣】：{USER_INTEREST_DESCRIPTION}
     
     【论文标题】：{title}
     【论文摘要】：{abstract}
     
-    请只回答 "Yes" 或 "No"。如果论文的主题、方法或核心概念与用户的兴趣高度相关（包括概念上的相关性），回答 "Yes"，否则回答 "No"。不要输出任何其他解释。
+    规则：
+    1. 宁可错杀一千，不可放过一个。只要有一点点相关性，就回答 "Yes"。
+    2. 对于中文标题，请理解其语义。
+    3. 只回答 "Yes" 或 "No"。
     """
-
     try:
         response = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1, # 低温度保证回答稳定
-            max_tokens=5
+            model=LLM_MODEL, messages=[{"role": "user", "content": prompt}],
+            temperature=0.1, max_tokens=5
         )
-        answer = response.choices[0].message.content.strip().lower()
-        return "yes" in answer
-    except Exception as e:
-        print(f"AI Check Error: {e}")
-        # 如果AI报错（比如网络问题），默认放行或者设为False，这里设为False防止乱发
+        return "yes" in response.choices[0].message.content.strip().lower()
+    except:
         return False
 
-def clean_html_text(raw_html):
-    if not raw_html: return ""
-    soup = BeautifulSoup(raw_html, "html.parser")
-    text = soup.get_text(separator=' ')
+def clean_html(raw):
+    if not raw: return ""
+    # 移除 RSSHub 加入的无关广告词
+    text = BeautifulSoup(raw, "html.parser").get_text(separator=' ')
     return ' '.join(text.split())
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS articles
-                 (link TEXT PRIMARY KEY, title TEXT, journal TEXT, published_date TEXT)''')
-    conn.commit()
+    conn.execute('''CREATE TABLE IF NOT EXISTS articles (link TEXT PRIMARY KEY, title TEXT, journal TEXT, published_date TEXT)''')
     conn.close()
 
-def is_article_new(link):
+def is_new(link):
     conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT 1 FROM articles WHERE link=?", (link,))
-    exists = c.fetchone()
+    exists = conn.execute("SELECT 1 FROM articles WHERE link=?", (link,)).fetchone()
     conn.close()
     return exists is None
 
 def save_article(link, title, journal, pub_date):
     conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO articles VALUES (?, ?, ?, ?)", (link, title, journal, pub_date))
+    conn.execute("INSERT OR IGNORE INTO articles VALUES (?, ?, ?, ?)", (link, title, journal, pub_date))
     conn.commit()
     conn.close()
 
-def send_html_email(subject, html_content):
-    if not SENDER_EMAIL or not SENDER_PASSWORD:
-        return False
-    msg = MIMEText(html_content, 'html', 'utf-8')
-    msg['From'] = Header(SENDER_EMAIL)
-    msg['To'] = Header(RECEIVER_EMAIL)
-    msg['Subject'] = Header(subject, 'utf-8')
+def send_email(subject, html):
+    if not SENDER_PASSWORD: return False
+    msg = MIMEText(html, 'html', 'utf-8')
+    msg['From'], msg['To'], msg['Subject'] = Header(SENDER_EMAIL), Header(RECEIVER_EMAIL), Header(subject, 'utf-8')
     try:
-        server = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT)
-        server.login(SENDER_EMAIL, SENDER_PASSWORD)
-        server.sendmail(SENDER_EMAIL, [RECEIVER_EMAIL], msg.as_string())
-        server.quit()
-        print("Email sent successfully.")
+        s = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT)
+        s.login(SENDER_EMAIL, SENDER_PASSWORD)
+        s.sendmail(SENDER_EMAIL, [RECEIVER_EMAIL], msg.as_string())
+        s.quit()
         return True
     except Exception as e:
         print(f"Email Error: {e}")
         return False
 
 def run_job():
-    print(f"[{datetime.now()}] Job started...")
-    
+    print("Job started...")
     monthly_data = {}
-    total_new_count = 0
+    total_new = 0
     interesting_count = 0
-    pending_save_list = []
+    pending_save = []
 
-    for journal_name, rss_url in RSS_FEEDS.items():
-        print(f"Checking {journal_name}...")
+    # 忽略 SSL 证书验证 (解决 RSSHub 有时证书报错的问题)
+    if hasattr(ssl, '_create_unverified_context'):
+        ssl._create_default_https_context = ssl._create_unverified_context
+
+    for journal, url in RSS_FEEDS.items():
+        print(f"Checking {journal}...")
         try:
-            feed = feedparser.parse(rss_url)
-            if not feed.entries: continue
+            # 增加超时设置，因为 RSSHub 有时较慢
+            feed = feedparser.parse(url) 
+            
+            if not feed.entries:
+                print(f"  > Warning: No entries for {journal} (Link might be blocked temporarily)")
+                continue
 
-            # 为了节省Token和时间，限制每次最多检查前30篇
-            for entry in feed.entries[:30]: 
+            # 中文期刊通常一更就是一期(10-20篇)，检查前 20 篇
+            for entry in feed.entries[:20]: 
                 title = entry.title
                 link = entry.link
-                pub_date = entry.get('published', datetime.now().strftime('%Y-%m-%d'))
+                # 处理日期格式，如果获取失败默认用今天
+                date = datetime.now().strftime('%Y-%m-%d')
+                if 'published' in entry:
+                    try: date = entry.published[:10]
+                    except: pass
                 
-                # 只有当文章是新的才去调用AI检查（省钱、省时间）
-                if is_article_new(link):
-                    raw_summary = entry.get('summary') or entry.get('description') or ""
-                    clean_summary = clean_html_text(raw_summary)
+                if is_new(link):
+                    # 1. 关键词白名单检查 (支持中文)
+                    is_match = False
+                    for kw in MUST_HAVE_KEYWORDS:
+                        if kw.lower() in title.lower():
+                            is_match = True
+                            print(f"  >>> [Keyword Match] {title[:30]}...")
+                            break
+                    
+                    summary = clean_html(entry.get('summary') or entry.get('description'))
+                    
+                    # 2. AI 检查
+                    if not is_match:
+                        print(f"  ...asking AI: {title[:30]}...")
+                        is_match = get_ai_judgement(title, summary)
+                        time.sleep(0.2)
 
-                    # === 调用 AI 进行智能判断 ===
-                    # 打印一下正在检查哪篇，方便在 GitHub Log 里看
-                    print(f"Analyzing with AI: {title[:50]}...") 
-                    is_interesting = get_ai_judgement(title, clean_summary)
-                    time.sleep(0.2) # 稍微歇一下，防止API速率限制
+                    if journal not in monthly_data: monthly_data[journal] = []
                     
-                    if journal_name not in monthly_data:
-                        monthly_data[journal_name] = []
+                    info = {"title": title, "link": link, "date": date, "summary": summary, "is_interesting": is_match}
                     
-                    article_info = {
-                        "title": title,
-                        "link": link,
-                        "date": pub_date,
-                        "journal": journal_name,
-                        "summary": clean_summary,
-                        "is_interesting": is_interesting
-                    }
-                    
-                    if is_interesting:
-                        monthly_data[journal_name].insert(0, article_info)
+                    if is_match:
+                        monthly_data[journal].insert(0, info)
                         interesting_count += 1
-                        print(f"  >>> MATCH FOUND: {title[:30]}")
                     else:
-                        monthly_data[journal_name].append(article_info)
-                        
-                    pending_save_list.append(article_info)
-                    total_new_count += 1
+                        monthly_data[journal].append(info)
+                    
+                    pending_save.append(info)
+                    total_new += 1
         except Exception as e:
-            print(f"Error checking {journal_name}: {e}")
+            print(f"Error checking {journal}: {e}")
 
-    if total_new_count > 0:
-        print(f"Found {total_new_count} new articles ({interesting_count} AI-Matched).")
+    if total_new > 0:
+        print(f"Found {total_new} articles, {interesting_count} interesting.")
+        subject_icon = "🤖 " if interesting_count > 0 else ""
         
-        subject_prefix = "🤖 " if interesting_count > 0 else ""
+        html = f"""<html><body style="font-family:Arial;">
+        <h2>📅 顶刊文献更新 (中英文混排)</h2>
+        <div style="background:#e8f4fd;padding:10px;margin-bottom:20px;border-radius:5px;">
+        <b>筛选策略：</b>包含 FinTech/机器学习/气候风险 等中英文关键词，或经 AI 判定符合兴趣。
+        </div><hr>"""
         
-        html_body = f"""
-        <html>
-        <body style="font-family: Arial, sans-serif;">
-            <h2 style="color: #2c3e50;">📅 金融顶刊 AI 筛选汇总</h2>
-            <p>本次更新 <b>{total_new_count}</b> 篇文章，AI 助手为您识别出 <b>{interesting_count}</b> 篇相关文章。</p>
-            <div style="background-color: #e8f4fd; padding: 10px; border-radius: 5px; color: #555; font-size: 0.9em; margin-bottom: 20px;">
-                <b>您的筛选标准:</b><br>{USER_INTEREST_DESCRIPTION.replace(chr(10), '<br>')}
-            </div>
-            <hr>
-        """
-        
-        for journal, articles in monthly_data.items():
-            html_body += f"<h3 style='background-color: #f2f2f2; padding: 10px; border-left: 5px solid #0066cc;'>📚 {journal} ({len(articles)}篇)</h3><ul>"
-            for art in articles:
+        for journal, arts in monthly_data.items():
+            html += f"<h3 style='background:#f2f2f2;padding:10px;border-left:5px solid #0066cc;'>{journal}</h3><ul>"
+            for art in arts:
                 if art['is_interesting']:
-                    icon = "💡" # AI 推荐的图标
-                    title_style = "color: #d35400; font-weight: bold; font-size: 1.1em;"
-                    # AI 推荐的文章，显示摘要
-                    summary_html = f"<div style='background-color: #fff8f0; padding: 10px; margin-top: 5px; border-radius: 5px; color: #444; font-size: 0.9em; line-height: 1.5;'>{art['summary'][:600]}...</div>"
+                    style = "color:#d35400;font-weight:bold;font-size:1.1em;"
+                    summ = f"<div style='background:#fff8f0;padding:8px;margin-top:5px;color:#555;font-size:0.9em;'>{art['summary'][:300]}...</div>"
+                    icon = "💡"
                 else:
-                    icon = ""
-                    title_style = "color: #0066cc; font-weight: bold;"
-                    summary_html = "" # 普通文章不显示摘要
+                    style, summ, icon = "color:#0066cc;font-weight:bold;", "", ""
+                
+                html += f"<li style='margin-bottom:15px;'>{icon} <a href='{art['link']}' style='{style}text-decoration:none;'>{art['title']}</a><span style='color:#999;font-size:0.8em;margin-left:10px;'>{art['date']}</span>{summ}</li>"
+            html += "</ul>"
+        
+        html += "</body></html>"
 
-                html_body += f"""
-                <li style="margin-bottom: 20px;">
-                    {icon} <a href="{art['link']}" style="{title_style} text-decoration: none;">{art['title']}</a>
-                    <span style="color: #999; font-size: 0.85em; margin-left: 10px;">{art['date']}</span>
-                    {summary_html}
-                </li>
-                """
-            html_body += "</ul>"
-        
-        html_body += "</body></html>"
-        
-        if send_html_email(f"{subject_prefix}AI精选顶刊: {interesting_count}/{total_new_count}篇", html_body):
-            print("Saving to DB...")
-            for art in pending_save_list:
-                save_article(art['link'], art['title'], art['journal'], art['date'])
+        if send_email(f"{subject_icon}文献更新: {interesting_count}篇精选 ({total_new}篇新增)", html):
+            for art in pending_save: save_article(art['link'], art['title'], art['journal'], art['date'])
+            # 自动同步数据库
+            os.system('git config --global user.name "Bot" && git config --global user.email "bot@bot.com"')
+            os.system('git add finance_journals.db && git commit -m "Update DB" && git pull --rebase origin main && git push')
     else:
         print("No new articles.")
 
