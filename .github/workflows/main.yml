@@ -34,7 +34,7 @@ jobs:
         RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
       run: python main.py
 
-- name: Commit and Push DB changes
+    - name: Commit and Push DB changes
       run: |
         git config --global user.name "GitHub Action Bot"
         git config --global user.email "actions@github.com"
@@ -50,3 +50,5 @@ jobs:
         
         # 4. 最后再推送
         git push
+
+  
