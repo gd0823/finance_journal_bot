@@ -4,6 +4,7 @@ import smtplib
 import os
 import time
 import ssl
+import urllib.parse
 from email.mime.text import MIMEText
 from email.header import Header
 from datetime import datetime
@@ -12,7 +13,7 @@ from openai import OpenAI
 
 # ================= 配置区域 =================
 
-# 1. 环境变量
+# 1. 环境变量 (无需修改，去GitHub Settings填Secrets)
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL")
 SENDER_PASSWORD = os.environ.get("SENDER_PASSWORD")
 RECEIVER_EMAIL = os.environ.get("RECEIVER_EMAIL")
@@ -20,7 +21,7 @@ LLM_API_KEY = os.environ.get("LLM_API_KEY")
 SMTP_SERVER = "smtp.qq.com"
 SMTP_PORT = 465
 
-# 2. 🛡️ 【白名单兜底】中英文关键词 (不区分大小写)
+# 2. 🛡️ 【白名单兜底】中英文关键词 (包含即选中)
 MUST_HAVE_KEYWORDS = [
     # --- English ---
     "fintech", "financial technology", 
@@ -28,7 +29,7 @@ MUST_HAVE_KEYWORDS = [
     "climate risk", "esg", "textual analysis",
     # --- 中文 ---
     "金融科技", "机器学习", "深度学习", "神经网络", "文本分析",
-     "大语言模型", "高频交易", "量化投资"
+    "大语言模型", "高频交易", "量化投资"
 ]
 
 # 3. 🤖 【AI 判别标准】
@@ -40,9 +41,7 @@ USER_INTEREST_DESCRIPTION = """
 3. **资产定价**：股票收益预测、因子模型、量化策略。
 4. **计量**：因果推断模型、计量模型。
 
-注意：
-- 对于中文文章，请同样应用上述标准。
-- 如果没有摘要，仅根据标题判断。
+注意：对于中文文章同理。如果没有摘要，仅根据标题判断。
 """
 
 # 4. 📚 期刊 RSS 列表
@@ -70,22 +69,32 @@ DB_FILE = "finance_journals.db"
 
 # ================= 核心代码 =================
 
+def get_zju_vpn_link(original_url):
+    """
+    将普通链接转换为浙大 WebVPN 格式
+    Ex: https://www.sciencedirect.com/... -> https://www-sciencedirect-com.webvpn.zju.edu.cn/...
+    """
+    try:
+        parsed = urllib.parse.urlparse(original_url)
+        # 将域名中的 . 替换为 -
+        domain_trans = parsed.netloc.replace('.', '-')
+        # 重新拼接
+        vpn_url = f"https://{domain_trans}.webvpn.zju.edu.cn{parsed.path}"
+        if parsed.query:
+            vpn_url += f"?{parsed.query}"
+        return vpn_url
+    except:
+        return "https://webvpn.zju.edu.cn/"
+
 def get_ai_judgement(title, abstract):
     if not LLM_API_KEY: return False
     client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
-    
     prompt = f"""
     判断这篇金融论文是否符合用户兴趣。
-    
     【用户兴趣】：{USER_INTEREST_DESCRIPTION}
-    
     【论文标题】：{title}
     【论文摘要】：{abstract}
-    
-    规则：
-    1. 宁可错杀一千，不可放过一个。只要有一点点相关性，就回答 "Yes"。
-    2. 对于中文标题，请理解其语义。
-    3. 只回答 "Yes" 或 "No"。
+    规则：1. 宁可错杀一千，不可放过一个。2. 只回答 "Yes" 或 "No"。
     """
     try:
         response = client.chat.completions.create(
@@ -143,7 +152,7 @@ def run_job():
     if hasattr(ssl, '_create_unverified_context'):
         ssl._create_default_https_context = ssl._create_unverified_context
 
-    # 【新增】伪装成 Chrome 浏览器，防止被拦截 (解决 No entries 问题)
+    # 伪装成 Chrome 浏览器
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     }
@@ -151,7 +160,6 @@ def run_job():
     for journal, url in RSS_FEEDS.items():
         print(f"Checking {journal}...")
         try:
-            # 传入 request_headers
             feed = feedparser.parse(url, request_headers=headers)
             
             if not feed.entries:
@@ -167,8 +175,8 @@ def run_job():
                     except: pass
                 
                 if is_new(link):
-                    # 1. 关键词白名单检查
                     is_match = False
+                    # 1. 关键词检查
                     for kw in MUST_HAVE_KEYWORDS:
                         if kw.lower() in title.lower():
                             is_match = True
@@ -181,18 +189,13 @@ def run_job():
                     if not is_match:
                         print(f"  ...asking AI: {title[:30]}...")
                         is_match = get_ai_judgement(title, summary)
-                        time.sleep(0.2) # 防止 API 超速
+                        time.sleep(0.2) 
 
                     if journal not in monthly_data: monthly_data[journal] = []
                     
-                    # 【关键修复】补全 info 字典，加入 journal 字段
                     info = {
-                        "title": title, 
-                        "link": link, 
-                        "date": date, 
-                        "summary": summary, 
-                        "is_interesting": is_match,
-                        "journal": journal  # 之前报错是因为缺了这个
+                        "title": title, "link": link, "date": date, 
+                        "summary": summary, "is_interesting": is_match, "journal": journal
                     }
                     
                     if is_match:
@@ -219,6 +222,12 @@ def run_job():
         for journal, arts in monthly_data.items():
             html += f"<h3 style='background:#f2f2f2;padding:10px;border-left:5px solid #0066cc;'>{journal}</h3><ul>"
             for art in arts:
+                # 生成链接
+                search_query = urllib.parse.quote(art['title'])
+                google_link = f"https://scholar.google.com/scholar?q={search_query}"
+                # 生成浙大 WebVPN 链接
+                zju_link = get_zju_vpn_link(art['link'])
+
                 if art['is_interesting']:
                     style = "color:#d35400;font-weight:bold;font-size:1.1em;"
                     summ = f"<div style='background:#fff8f0;padding:8px;margin-top:5px;color:#555;font-size:0.9em;'>{art['summary'][:300]}...</div>"
@@ -226,14 +235,24 @@ def run_job():
                 else:
                     style, summ, icon = "color:#0066cc;font-weight:bold;", "", ""
                 
-                html += f"<li style='margin-bottom:15px;'>{icon} <a href='{art['link']}' style='{style}text-decoration:none;'>{art['title']}</a><span style='color:#999;font-size:0.8em;margin-left:10px;'>{art['date']}</span>{summ}</li>"
+                html += f"""
+                <li style='margin-bottom:15px;'>
+                    {icon} 
+                    <a href='{art['link']}' style='{style}text-decoration:none;'>{art['title']}</a>
+                    <br>
+                    <span style='font-size:0.85em; color:#666;'>
+                        {art['date']} | 
+                        <a href="{zju_link}" style="color:#8e44ad;text-decoration:none;font-weight:bold;">🏫 浙大WebVPN直连</a> | 
+                        <a href="{google_link}" style="color:#2980b9;text-decoration:none;">🔍 Google Scholar</a>
+                    </span>
+                    {summ}
+                </li>"""
             html += "</ul>"
         
         html += "</body></html>"
 
         if send_email(f"{subject_icon}文献更新: {interesting_count}篇精选 ({total_new}篇新增)", html):
             for art in pending_save: 
-                # 这里现在不会报错了
                 save_article(art['link'], art['title'], art['journal'], art['date'])
             
             # 自动同步数据库
